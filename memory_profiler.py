@@ -1,9 +1,11 @@
 """Profile the memory usage of a Python program"""
 
+# Fork from https://github.com/pythonprofilers/memory_profiler
+# Based on version 0.58.0
 # .. we'll use this to pass it to the child script ..
 _CLEAN_GLOBALS = globals().copy()
 
-__version__ = '0.57.0'
+__version__ = '0.58.0a'
 
 _CMD_USAGE = "python -m memory_profiler script_file.py"
 
@@ -82,7 +84,7 @@ class MemitResult(object):
         p.text(u'<MemitResult : ' + msg + u'>')
 
 
-def _get_child_memory(process, meminfo_attr=None, memory_metric=0):
+def _get_child_memory(process, meminfo_attr=None):
     """
     Returns a generator that yields memory for all child processes.
     """
@@ -102,11 +104,7 @@ def _get_child_memory(process, meminfo_attr=None, memory_metric=0):
     # Loop over the child processes and yield their memory
     try:
         for child in getattr(process, children_attr)(recursive=True):
-            if isinstance(memory_metric, str):
-                meminfo = getattr(child, meminfo_attr)()
-                yield getattr(meminfo, memory_metric) / _TWO_20
-            else:
-                yield getattr(child, meminfo_attr)()[memory_metric] / _TWO_20
+            yield getattr(child, meminfo_attr)()[0] / _TWO_20
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         # https://github.com/fabianp/memory_profiler/issues/71
         yield 0.0
@@ -142,35 +140,6 @@ def _get_memory(pid, backend, timestamps=False, include_children=False, filename
                 return mem, time.time()
             else:
                 return mem
-        except psutil.AccessDenied:
-            pass
-            # continue and try to get this from ps
-
-    def _ps_util_full_tool(memory_metric):
-
-        # .. cross-platform but requires psutil > 4.0.0 ..
-        process = psutil.Process(pid)
-        try:
-            if not hasattr(process, 'memory_full_info'):
-                raise NotImplementedError("Backend `{}` requires psutil > 4.0.0".format(memory_metric))
-
-            meminfo_attr = 'memory_full_info'
-            meminfo = getattr(process, meminfo_attr)()
-
-            if not hasattr(meminfo, memory_metric):
-                raise NotImplementedError(
-                    "Metric `{}` not available. For details, see:".format(memory_metric) +
-                    "https://psutil.readthedocs.io/en/latest/index.html?highlight=memory_info#psutil.Process.memory_full_info")
-            mem = getattr(meminfo, memory_metric) / _TWO_20
-
-            if include_children:
-                mem +=  sum(_get_child_memory(process, meminfo_attr, memory_metric))
-
-            if timestamps:
-                return mem, time.time()
-            else:
-                return mem
-        
         except psutil.AccessDenied:
             pass
             # continue and try to get this from ps
@@ -213,8 +182,6 @@ def _get_memory(pid, backend, timestamps=False, include_children=False, filename
 
     tools = {'tracemalloc': tracemalloc_tool,
              'psutil': ps_util_tool,
-             'psutil_pss': lambda: _ps_util_full_tool(memory_metric="pss"),
-             'psutil_uss': lambda: _ps_util_full_tool(memory_metric="uss"),
              'posix': posix_tool}
     return tools[backend]()
 
@@ -309,12 +276,6 @@ def memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
         the subprocess. Useful for long-running processes.
         Implies timestamps=True.
 
-    backend : str, optional
-        Current supported backends: 'psutil', 'psutil_pss', 'psutil_uss', 'posix', 'tracemalloc'
-        If `backend=None` the default is "psutil" which measures RSS aka “Resident Set Size”. 
-        For more information on "psutil_pss" (measuring PSS) and "psutil_uss" please refer to:
-        https://psutil.readthedocs.io/en/latest/index.html?highlight=memory_info#psutil.Process.memory_full_info 
-
     max_iterations : int
         Limits the number of iterations (calls to the process being monitored). Relevent
         when the process is a python function.
@@ -404,7 +365,7 @@ def memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
                     proc.pid, backend, timestamps=timestamps,
                     include_children=include_children)
 
-                if mem_usage and stream is not None:
+                if stream is not None:
                     stream.write("MEM {0:.6f} {1:.4f}\n".format(*mem_usage))
 
                     # Write children to the stream file
@@ -748,11 +709,9 @@ class LineProfiler(object):
         """
 
         if iscoroutinefunction(func):
-            @coroutine
-            def f(*args, **kwargs):
+            async def f(*args, **kwargs):
                 with self._count_ctxmgr():
-                    res = yield from func(*args, **kwargs)
-                    return res
+                    return await func(*args, **kwargs)
         else:
             def f(*args, **kwds):
                 with self._count_ctxmgr():
@@ -854,7 +813,7 @@ def show_results(prof, stream=None, precision=1):
     template = '{0:>6} {1:>12} {2:>12}  {3:>10}   {4:<}'
 
     for (filename, lines) in prof.code_map.items():
-        header = template.format('Line #', 'Mem usage', 'Increment', 'Occurrences',
+        header = template.format('Line #', 'Mem usage', 'Increment', 'Occurences',
                                  'Line Contents')
 
         stream.write(u'Filename: ' + filename + '\n\n')
@@ -870,13 +829,13 @@ def show_results(prof, stream=None, precision=1):
                 inc = mem[0]
                 total_mem = mem[1]
                 total_mem = template_mem.format(total_mem)
-                occurrences = mem[2]
+                occurences = mem[2]
                 inc = template_mem.format(inc)
             else:
                 total_mem = u''
                 inc = u''
-                occurrences = u''
-            tmp = template.format(lineno, total_mem, inc, occurrences, all_lines[lineno - 1])
+                occurences = u''
+            tmp = template.format(lineno, total_mem, inc, occurences, all_lines[lineno - 1])
             stream.write(tmp)
         stream.write(u'\n\n')
 
@@ -1172,15 +1131,12 @@ def profile(func=None, stream=None, precision=1, backend='psutil'):
             show_results, stream=stream, precision=precision
         )
         if iscoroutinefunction(func):
-            @wraps(wrapped=func)
-            @coroutine
-            def wrapper(*args, **kwargs):
+            async def wrapper(*args, **kwargs):
                 prof = get_prof()
-                val = yield from prof(func)(*args, **kwargs)
+                val = await prof(func)(*args, **kwargs)
                 show_results_bound(prof)
                 return val
         else:
-            @wraps(wrapped=func)
             def wrapper(*args, **kwargs):
                 prof = get_prof()
                 val = prof(func)(*args, **kwargs)
@@ -1205,8 +1161,6 @@ def choose_backend(new_backend=None):
     _backend = 'no_backend'
     all_backends = [
         ('psutil', True),
-        ('psutil_pss', True),
-        ('psutil_uss', True),
         ('posix', os.name == 'posix'),
         ('tracemalloc', has_tracemalloc),
     ]
@@ -1246,7 +1200,7 @@ def exec_with_profiler(filename, profiler, backend, passed_args=[]):
     try:
         if _backend == 'tracemalloc' and has_tracemalloc:
             tracemalloc.start()
-        with open(filename, encoding='utf-8') as f:
+        with open(filename) as f:
             exec(compile(f.read(), filename, 'exec'), ns, ns)
     finally:
         if has_tracemalloc and tracemalloc.is_tracing():
@@ -1324,9 +1278,9 @@ if __name__ == '__main__':
         default=False, action='store_true',
         help='also include memory used by child processes')
     parser.add_argument('--backend', dest='backend', type=str, action='store',
-        choices=['tracemalloc', 'psutil', 'psutil_pss', 'psutil_uss', 'posix'], default='psutil',
+        choices=['tracemalloc', 'psutil', 'posix'], default='psutil',
         help='backend using for getting memory info '
-             '(one of the {tracemalloc, psutil, posix, psutil_pss, psutil_uss, posix})')
+             '(one of the {tracemalloc, psutil, posix})')
     parser.add_argument("program", nargs=REMAINDER,
         help='python script or module followed by command line arguements to run')
     args = parser.parse_args()
